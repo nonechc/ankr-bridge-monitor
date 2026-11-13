@@ -1,0 +1,113 @@
+name: Ankr Bridge Monitor
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Ankr Bridge Status
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          pip install requests
+          python3 << 'EOF'
+          import requests
+          import os
+          from datetime import datetime
+
+          BRIDGE = "0xc437DF90B37C1dB6657339E31BfE54627f0e7181"
+          OLD_IMPLEMENTATION = "0x85Ea08796Eb66820379039cAb034722E69E4e16C".lower()
+          IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+          PAUSED_SELECTOR = "0x5c975abb"
+
+          TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+          TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+          RPCS = [
+              "https://ethereum.publicnode.com",
+              "https://eth.llamarpc.com",
+              "https://eth.drpc.org",
+          ]
+
+          def rpc_call(method, params):
+              for rpc in RPCS:
+                  try:
+                      payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+                      r = requests.post(rpc, json=payload, timeout=15)
+                      result = r.json()
+                      if "result" in result:
+                          return result["result"]
+                  except:
+                      continue
+              return None
+
+          def is_paused():
+              result = rpc_call("eth_call", [{"to": BRIDGE, "data": PAUSED_SELECTOR}, "latest"])
+              if result:
+                  return int(result, 16) == 1
+              return None
+
+          def get_implementation():
+              result = rpc_call("eth_getStorageAt", [BRIDGE, IMPL_SLOT, "latest"])
+              if result and int(result, 16) != 0:
+                  return "0x" + result[-40:]
+              return None
+
+          def send_telegram(message):
+              if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+                  print("Telegram not configured")
+                  return
+              url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+              payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+              try:
+                  requests.post(url, json=payload, timeout=10)
+                  print("Telegram sent")
+              except Exception as e:
+                  print(f"Telegram error: {e}")
+
+          now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+          print(f"Ankr Bridge Monitor - {now}")
+
+          paused = is_paused()
+          if paused is None:
+              msg = f"❌ <b>Ankr Bridge 监控失败</b>\n时间: {now}\n无法连接 RPC"
+              print(msg)
+              send_telegram(msg)
+              exit(1)
+
+          if paused:
+              print("合约仍处于暂停状态")
+              exit(0)
+
+          print("合约已 unpause，检查 Implementation...")
+          impl = get_implementation()
+
+          if not impl:
+              msg = f"⚠️ <b>Ankr Bridge 已 unpause</b>\n时间: {now}\n但无法获取 Implementation"
+              print(msg)
+              send_telegram(msg)
+              exit(0)
+
+          upgraded = impl.lower() != OLD_IMPLEMENTATION
+
+          if upgraded:
+              status = "✅ Implementation 已更换（可能已修复）"
+              emoji = "✅"
+          else:
+              status = "🚨 Implementation 未升级！漏洞逻辑可能仍存在！"
+              emoji = "🚨"
+
+          msg = (
+              f"{emoji} <b>Ankr Bridge 已 unpause</b>\n"
+              f"时间: {now}\n"
+              f"Implementation: <code>{impl}</code>\n"
+              f"{status}"
+          )
+          print(msg)
+          send_telegram(msg)
+          EOF
